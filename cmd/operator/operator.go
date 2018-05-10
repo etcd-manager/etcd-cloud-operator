@@ -29,10 +29,8 @@ import (
 	"github.com/quentin-m/etcd-cloud-operator/pkg/operator"
 
 	// Register providers.
-	_ "github.com/quentin-m/etcd-cloud-operator/pkg/providers/asg/aws"
 	_ "github.com/quentin-m/etcd-cloud-operator/pkg/providers/asg/docker"
 	_ "github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot/file"
-	_ "github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot/s3"
 )
 
 func main() {
