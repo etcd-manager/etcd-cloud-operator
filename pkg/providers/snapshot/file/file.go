@@ -23,8 +23,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot"
+	"github.com/appscode/etcd-disco/pkg/providers"
+	"github.com/appscode/etcd-disco/pkg/providers/snapshot"
 	log "github.com/sirupsen/logrus"
 )
 

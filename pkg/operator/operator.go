@@ -15,20 +15,22 @@
 package operator
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/appscode/etcd-disco/pkg/etcd"
+	"github.com/appscode/etcd-disco/pkg/etcdmain"
+	"github.com/appscode/etcd-disco/pkg/providers/snapshot"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/quentin-m/etcd-cloud-operator/pkg/etcd"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/asg"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot"
 )
 
 const (
@@ -41,9 +43,10 @@ type Operator struct {
 	server *etcd.Server
 
 	// New()
-	cfg              Config
-	asgProvider      asg.Provider
+	cfg Config
+	//asgProvider      asg.Provider
 	snapshotProvider snapshot.Provider
+	initialInstances []string
 
 	httpClient *http.Client
 
@@ -69,27 +72,51 @@ type Operator struct {
 type Config struct {
 	UnhealthyMemberTTL time.Duration `yaml:"unhealthy-member-ttl"`
 
-	Etcd     etcd.EtcdConfiguration `yaml:"etcd"`
-	ASG      asg.Config             `yaml:"asg"`
-	Snapshot snapshot.Config        `yaml:"snapshot"`
+	Etcd *etcdmain.Config/*EtcdConfiguration*/ `yaml:"etcd"`
+	//ASG      asg.Config             `yaml:"asg"`
+	Snapshot                snapshot.Config `yaml:"snapshot"`
+	InitialMembersAddresses []string        `yaml:"initial-member-addresses"`
+	CurrentMemberAddress    string          `yaml:"current-member-addres"`
+	//ClusterSize             int             `yaml:"custer-size"`
 }
 
 func New(cfg Config) *Operator {
 	// Initialize providers.
-	asgProvider, snapshotProvider := initProviders(cfg)
+	/*asgProvider, snapshotProvider := initProviders(cfg)
 	if snapshotProvider == nil || cfg.Snapshot.Interval == 0 {
 		log.Fatal("snapshots must be enabled for auto disaster recovery")
-	}
+	}*/
+	snapshotProvider := initSnapshotProvider(cfg.Snapshot)
 
 	// Setup signal handler.
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, syscall.SIGTERM)
+	var httpClient *http.Client
+	if cfg.Etcd.Ec.PeerAutoTLS || !cfg.Etcd.Ec.PeerTLSInfo.Empty() {
+		cert, err := tls.LoadX509KeyPair(cfg.Etcd.Ec.PeerTLSInfo.CertFile, cfg.Etcd.Ec.PeerTLSInfo.KeyFile)
+		fmt.Println(err)
+		caCert, err := ioutil.ReadFile(cfg.Etcd.Ec.PeerTLSInfo.TrustedCAFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				RootCAs:      caCertPool,
+			},
+		}
+		httpClient = &http.Client{Transport: tr, Timeout: isHealthyTimeout}
+	} else {
+		httpClient = &http.Client{Timeout: isHealthyTimeout}
+	}
 
 	return &Operator{
-		cfg:              cfg,
-		asgProvider:      asgProvider,
+		cfg: cfg,
+		//asgProvider:      asgProvider,
 		snapshotProvider: snapshotProvider,
-		httpClient:       &http.Client{Timeout: isHealthyTimeout},
+		httpClient:       httpClient,
 		state:            "UNKNOWN",
 		ticker:           time.NewTicker(loopInterval),
 		shutdownChan:     shutdownChan,
@@ -114,25 +141,32 @@ func (s *Operator) Run() {
 
 func (s *Operator) evaluate() error {
 	// Fetch the auto-scaling group state.
-	asgInstances, asgSelf, asgSize, err := s.asgProvider.AutoScalingGroupStatus()
+	/*asgInstances, asgSelf, asgSize, err := s.asgProvider.AutoScalingGroupStatus()
 	if err != nil {
 		return fmt.Errorf("failed to sync auto-scaling group: %v", err)
-	}
+	}*/
 
 	// Create the etcd cluster client.
-	client, err := etcd.NewClient(instancesAddresses(asgInstances), s.cfg.Etcd.ClientTransportSecurity, true)
+	client, err := etcd.NewClient(s.cfg.InitialMembersAddresses, etcd.SecurityConfig{
+		CAFile:        s.cfg.Etcd.Ec.ClientTLSInfo.CAFile,
+		CertFile:      s.cfg.Etcd.Ec.ClientTLSInfo.CertFile,
+		KeyFile:       s.cfg.Etcd.Ec.ClientTLSInfo.KeyFile,
+		CertAuth:      s.cfg.Etcd.Ec.ClientTLSInfo.ClientCertAuth,
+		TrustedCAFile: s.cfg.Etcd.Ec.ClientTLSInfo.TrustedCAFile,
+		AutoTLS:       s.cfg.Etcd.Ec.ClientAutoTLS,
+	}, true)
 	if err != nil {
 		log.WithError(err).Warn("failed to create etcd cluster client")
 	}
 
 	// Output.
 	if s.server == nil {
-		s.server = etcd.NewServer(serverConfig(s.cfg, asgSelf, s.snapshotProvider))
+		s.server = etcd.NewServer(serverConfig(s.cfg, s.snapshotProvider), s.cfg.Etcd)
 	}
 
 	s.etcdRunning = s.server.IsRunning()
-	s.etcdHealthy, s.isSeeder, s.states = fetchStatuses(s.httpClient, client, asgInstances, asgSelf)
-	s.clusterSize = asgSize
+	s.etcdHealthy, s.isSeeder, s.states = fetchStatuses(s.httpClient, client, s.cfg.InitialMembersAddresses, s.cfg.CurrentMemberAddress)
+	s.clusterSize = len(s.states)
 
 	s.etcdClient = client
 	return nil
@@ -181,12 +215,13 @@ func (s *Operator) execute() error {
 	case !s.etcdHealthy && !s.etcdRunning && (s.states["START"] != s.clusterSize || !s.isSeeder):
 		if s.state != "START" {
 			var err error
-			if s.etcdSnapshot, err = s.server.SnapshotInfo(); err != nil && err != snapshot.ErrNoSnapshot{
+			if s.etcdSnapshot, err = s.server.SnapshotInfo(); err != nil && err != snapshot.ErrNoSnapshot {
 				return err
 			}
 		}
 		log.Info("STATUS: Unhealthy + Not running -> Ready to start + Pending all ready / seeder")
 		s.state = "START"
+		fmt.Println(s.etcdHealthy, "<>", s.etcdRunning, "<>", s.states, "<>", s.clusterSize, "<>", s.isSeeder)
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	case !s.etcdHealthy && !s.etcdRunning && s.states["START"] == s.clusterSize && s.isSeeder:
 		log.Info("STATUS: Unhealthy + Not running + All ready + Seeder status -> Seeding cluster")
@@ -221,7 +256,11 @@ func (s *Operator) webserver() {
 			log.WithError(err).Warn("failed to write status")
 		}
 	})
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", webServerPort), nil))
+	if s.cfg.Etcd.Ec.PeerAutoTLS || !s.cfg.Etcd.Ec.PeerTLSInfo.Empty() {
+		log.Fatal(http.ListenAndServeTLS(fmt.Sprintf(":%d", webServerPort), s.cfg.Etcd.Ec.PeerTLSInfo.CertFile, s.cfg.Etcd.Ec.PeerTLSInfo.KeyFile, nil))
+	} else {
+		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", webServerPort), nil))
+	}
 }
 
 func (s *Operator) wait() {

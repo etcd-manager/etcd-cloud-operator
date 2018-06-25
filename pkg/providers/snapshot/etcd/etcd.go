@@ -23,10 +23,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/appscode/etcd-disco/pkg/providers"
+	"github.com/appscode/etcd-disco/pkg/providers/snapshot"
 	"github.com/coreos/bbolt"
-
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot"
 )
 
 func init() {

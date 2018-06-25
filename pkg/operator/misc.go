@@ -23,11 +23,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/appscode/etcd-disco/pkg/etcd"
+	"github.com/appscode/etcd-disco/pkg/providers/snapshot"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/quentin-m/etcd-cloud-operator/pkg/etcd"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/asg"
-	"github.com/quentin-m/etcd-cloud-operator/pkg/providers/snapshot"
 )
 
 const (
@@ -36,42 +34,28 @@ const (
 )
 
 type status struct {
-	instance asg.Instance
+	instance string
 
 	State    string `json:"state"`
 	Revision int64  `json:"revision"`
 }
 
-func initProviders(cfg Config) (asg.Provider, snapshot.Provider) {
-	if cfg.ASG.Provider == "" {
-		log.Fatal("no auto-scaling group provider configuration given")
-	}
-	asgProvider, ok := asg.AsMap()[cfg.ASG.Provider]
+func initSnapshotProvider(cfg snapshot.Config) snapshot.Provider {
+	snapshotProvider, ok := snapshot.AsMap()[cfg.Provider]
 	if !ok {
-		log.Fatalf("unknown auto-scaling group provider %q, available providers: %v", cfg.ASG.Provider, asg.AsList())
+		log.Fatalf("unknown snapshot provider %q, available providers: %v", cfg.Provider, snapshot.AsList())
 	}
-	if err := asgProvider.Configure(cfg.ASG); err != nil {
-		log.WithError(err).Fatal("failed to configure auto-scaling group provider")
-	}
-
-	if cfg.Snapshot.Provider == "" {
-		return asgProvider, nil
-	}
-	snapshotProvider, ok := snapshot.AsMap()[cfg.Snapshot.Provider]
-	if !ok {
-		log.Fatalf("unknown snapshot provider %q, available providers: %v", cfg.Snapshot.Provider, snapshot.AsList())
-	}
-	if err := snapshotProvider.Configure(cfg.Snapshot); err != nil {
+	if err := snapshotProvider.Configure(cfg); err != nil {
 		log.WithError(err).Fatal("failed to configure snapshot provider")
 	}
 
-	return asgProvider, snapshotProvider
+	return snapshotProvider
 }
 
-func fetchStatuses(httpClient *http.Client, etcdClient *etcd.Client, asgInstances []asg.Instance, asgSelf asg.Instance) (bool, bool, map[string]int) {
+func fetchStatuses(httpClient *http.Client, etcdClient *etcd.Client, Instances []string, self string) (bool, bool, map[string]int) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	wg.Add(1 + len(asgInstances))
+	wg.Add(1 + len(Instances))
 
 	// Fetch etcd's healthiness.
 	var etcdHealthy bool
@@ -82,13 +66,13 @@ func fetchStatuses(httpClient *http.Client, etcdClient *etcd.Client, asgInstance
 
 	// Fetch ECO statuses.
 	var ecoStatuses []*status
-	for _, asgInstance := range asgInstances {
-		go func(asgInstance asg.Instance) {
+	for _, instance := range Instances {
+		go func(instance string) {
 			defer wg.Done()
 
-			st, err := fetchStatus(httpClient, asgInstance)
+			st, err := fetchStatus(httpClient, instance)
 			if err != nil {
-				log.WithError(err).Warnf("failed to query %s's ECO instance", asgInstance.Name())
+				log.WithError(err).Warnf("failed to query %s's instance", instance)
 				return
 			}
 
@@ -96,14 +80,14 @@ func fetchStatuses(httpClient *http.Client, etcdClient *etcd.Client, asgInstance
 			defer mu.Unlock()
 
 			ecoStatuses = append(ecoStatuses, st)
-		}(asgInstance)
+		}(instance)
 	}
 	wg.Wait()
 
 	// Sort the ECO statuses so we can systematically find the identity of the seeder.
 	sort.Slice(ecoStatuses, func(i, j int) bool {
 		if ecoStatuses[i].Revision == ecoStatuses[j].Revision {
-			return ecoStatuses[i].instance.Name() < ecoStatuses[j].instance.Name()
+			return ecoStatuses[i].instance < ecoStatuses[j].instance
 		}
 		return ecoStatuses[i].Revision < ecoStatuses[j].Revision
 	})
@@ -116,12 +100,17 @@ func fetchStatuses(httpClient *http.Client, etcdClient *etcd.Client, asgInstance
 		}
 		ecoStates[ecoStatus.State]++
 	}
+	fmt.Println(ecoStatuses[len(ecoStatuses)-1].instance, self, "**********")
 
-	return etcdHealthy, ecoStatuses[len(ecoStatuses)-1].instance.Name() == asgSelf.Name(), ecoStates
+	return etcdHealthy, ecoStatuses[len(ecoStatuses)-1].instance == self, ecoStates
 }
 
-func fetchStatus(httpClient *http.Client, instance asg.Instance) (*status, error) {
-	resp, err := httpClient.Get(fmt.Sprintf("http://%s:%d/status", instance.Address(), webServerPort))
+func fetchStatus(httpClient *http.Client, instance string) (*status, error) {
+	scheme := "http"
+	if httpClient.Transport != nil {
+		scheme = "https"
+	}
+	resp, err := httpClient.Get(fmt.Sprintf("%s://%s:%d/status", scheme, instance, webServerPort))
 	if err != nil {
 		return nil, err
 	}
@@ -135,30 +124,17 @@ func fetchStatus(httpClient *http.Client, instance asg.Instance) (*status, error
 	var st status
 	err = json.Unmarshal(b, &st)
 	st.instance = instance
+	fmt.Println(st, "<<>>>>>>>>>>>")
 	return &st, err
 }
 
-func serverConfig(cfg Config, asgSelf asg.Instance, snapshotProvider snapshot.Provider) etcd.ServerConfig {
-	return etcd.ServerConfig{
-		Name:               asgSelf.Name(),
-		DataDir:            cfg.Etcd.DataDir,
-		DataQuota:          cfg.Etcd.BackendQuota,
-		PublicAddress:      stringOverride(asgSelf.Address(), cfg.Etcd.AdvertiseAddress),
-		PrivateAddress:     asgSelf.Address(),
-		ClientSC:           cfg.Etcd.ClientTransportSecurity,
-		PeerSC:             cfg.Etcd.PeerTransportSecurity,
+func serverConfig(cfg Config, snapshotProvider snapshot.Provider) *etcd.ServerConfig {
+	return &etcd.ServerConfig{
 		UnhealthyMemberTTL: cfg.UnhealthyMemberTTL,
 		SnapshotProvider:   snapshotProvider,
 		SnapshotInterval:   cfg.Snapshot.Interval,
 		SnapshotTTL:        cfg.Snapshot.TTL,
 	}
-}
-
-func instancesAddresses(instances []asg.Instance) (addresses []string) {
-	for _, instance := range instances {
-		addresses = append(addresses, instance.Address())
-	}
-	return
 }
 
 func stringOverride(s, override string) string {
